@@ -44,6 +44,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 #[cfg(unix)]
 const OBSERVER_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Control frames a client may leave unread before the server drops it.
+/// Control frames are never discarded, and shell clients get a full endpoint
+/// snapshot on every session change, so a client that stops reading would
+/// otherwise keep growing the server's memory for as long as it stays connected.
+/// The bound leaves room for several maximum-size graphics frames.
+const MAX_PENDING_CONTROL_BYTES: usize = 4 * MAX_GRAPHICS_FRAME_SIZE;
+
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 const MAX_CLIENT_SHELL_DIMENSION: u16 = 4096;
@@ -268,11 +275,16 @@ impl ClientRenderWriter {
 struct ClientWriterQueue {
     state: Mutex<ClientWriterQueueState>,
     ready: Condvar,
+    /// Shut down when the client falls too far behind, so the writer blocked on
+    /// the full socket and the reader waiting on it both exit.
+    #[cfg(unix)]
+    stream: std::sync::OnceLock<LocalStream>,
 }
 
 #[derive(Debug, Default)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    control_bytes: usize,
     ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
@@ -293,7 +305,14 @@ impl ClientWriterQueue {
                 ..ClientWriterQueueState::default()
             }),
             ready: Condvar::new(),
+            #[cfg(unix)]
+            stream: std::sync::OnceLock::new(),
         })
+    }
+
+    #[cfg(unix)]
+    fn shut_down_stream_on_overflow(&self, stream: LocalStream) {
+        let _ = self.stream.set(stream);
     }
 
     fn add_sender(&self) {
@@ -312,6 +331,26 @@ impl ClientWriterQueue {
         if !state.writer_alive {
             return Err(SendError(data));
         }
+        let pending = state.control_bytes.saturating_add(data.len());
+        if pending > MAX_PENDING_CONTROL_BYTES {
+            warn!(
+                pending_bytes = state.control_bytes,
+                "client stopped reading control frames, dropping it"
+            );
+            state.writer_alive = false;
+            state.control.clear();
+            state.control_bytes = 0;
+            state.render = None;
+            state.ordered.clear();
+            self.ready.notify_all();
+            drop(state);
+            #[cfg(unix)]
+            if let Some(stream) = self.stream.get() {
+                let _ = crate::platform::shutdown_client_stream(stream);
+            }
+            return Err(SendError(data));
+        }
+        state.control_bytes = pending;
         state.control.push_back(data);
         self.ready.notify_one();
         Ok(())
@@ -356,7 +395,11 @@ impl ClientWriterQueue {
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
+            if !state.writer_alive {
+                return None;
+            }
             if let Some(data) = state.control.pop_front() {
+                state.control_bytes = state.control_bytes.saturating_sub(data.len());
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.ordered.pop_front() {
@@ -856,6 +899,8 @@ pub(crate) fn handle_client_handshake(
 
     // Create separate channels for reliable control messages and droppable renders.
     let writer_queue = ClientWriterQueue::new();
+    #[cfg(unix)]
+    writer_queue.shut_down_stream_on_overflow(stream.try_clone()?);
     let writer = ClientWriter {
         control: ClientControlWriter::queue(writer_queue.clone()),
         render: ClientRenderWriter::queue(writer_queue.clone()),
@@ -1699,6 +1744,78 @@ mod tests {
             writer.render.try_send(vec![b'z']),
             Err(TrySendError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn unread_control_backlog_is_bounded() {
+        // Nothing drains the queue, as with a shell client that stopped reading
+        // while every session change queues another endpoint snapshot.
+        let (writer, queue) = test_queue_writer();
+        let frame_bytes = MAX_GRAPHICS_FRAME_SIZE / 2;
+        let mut accepted = 0;
+        let mut dropped = false;
+        for _ in 0..=MAX_PENDING_CONTROL_BYTES / frame_bytes {
+            if writer.control.send(vec![b'x'; frame_bytes]).is_err() {
+                dropped = true;
+                break;
+            }
+            accepted += frame_bytes;
+        }
+        assert!(dropped, "control backlog grew past {accepted} bytes");
+        assert!(accepted <= MAX_PENDING_CONTROL_BYTES);
+        assert!(queue.lock_state().control.is_empty());
+        assert!(matches!(writer.control.send(vec![b'y']), Err(SendError(_))));
+        assert!(matches!(
+            writer.render.try_send(vec![b'z']),
+            Err(TrySendError::Disconnected(_))
+        ));
+        assert_eq!(queue.recv(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_backlog_overflow_releases_stalled_writer_and_reader() {
+        let (_client, server, _path) = local_stream_pair("stalled-shell-client");
+        let writer_stream = server.try_clone().expect("clone writer stream");
+        let (writer, queue) = test_queue_writer();
+        queue.shut_down_stream_on_overflow(server.try_clone().expect("clone shutdown stream"));
+        let (events, _event_rx) = mpsc::channel(8);
+        let reader_events = events.clone();
+        let (reader_done_tx, reader_done) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = client_read_loop(
+                server,
+                15,
+                &reader_events,
+                &Arc::new(AtomicBool::new(false)),
+            );
+            let _ = reader_done_tx.send(result);
+        });
+        let (writer_done_tx, writer_done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            client_writer_loop(writer_stream, 15, queue, events);
+            let _ = writer_done_tx.send(());
+        });
+
+        // The client never reads, so the writer blocks on the first large frame.
+        let frame_bytes = MAX_GRAPHICS_FRAME_SIZE / 2;
+        let mut sends = 0;
+        while writer.control.send(vec![b'x'; frame_bytes]).is_ok() {
+            sends += 1;
+            assert!(
+                sends <= 2 * MAX_PENDING_CONTROL_BYTES / frame_bytes,
+                "stalled client was never dropped"
+            );
+        }
+        writer_done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked writer released");
+        reader_done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("reader released")
+            .unwrap();
+        worker.join().unwrap();
+        reader.join().unwrap();
     }
 
     /// Keeps both kernel socket buffers far below the frame size so the writer must
