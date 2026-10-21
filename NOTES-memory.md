@@ -279,16 +279,15 @@ Validation of the branch on the reproduction machine:
   `cargo clippy --all-targets --locked --jobs 4 -- -D warnings`: pass.
 - `cargo test --bin herdr -- control_backlog client_writer stalled_observer`:
   8 passed (the two new tests and the existing writer and observer tests).
-- Full `cargo test --locked --jobs 4`: **does not pass on this machine, and
-  equally not on untouched master `143bf5fd`.** In both, about a dozen tests
-  in `detect::manifest_update`, `plugin_installations`, `plugin_paths`,
-  `persist::plugin_registry` and `platform::linux` (clipboard) report
-  `FAILED`, then the test process is killed by SIGPIPE before it prints a
-  summary. The failing names are the same with and without this change, and
-  with the two new tests skipped; the ones tried alone pass. Tests that print
-  through the CLI switch SIGPIPE back to its default for the whole test
-  process (`begin_cli_output`, `src/cli.rs:10`), so a later write to a closed
-  pipe kills the run. That is pre-existing and was left alone here.
+- Full `cargo test --locked --jobs 4`: passes, after the `test:` commit on
+  this branch. On untouched master `143bf5fd` it does not pass under plain
+  `cargo test` (the project's own recipes use nextest, one process per test):
+  about a dozen tests fail and the test process is killed by SIGPIPE. The
+  causes were all in the tests sharing one process: CLI output tests made
+  SIGPIPE fatal for the whole process, tests changing `HOME`, `PATH`,
+  `TMPDIR` and XDG paths used separate locks or none, a caught panic stopped
+  every running test server, and three waits were too tight for a loaded
+  machine. The `test:` commit fixes those without changing product code.
 
 Follow-up worth deciding on, not written here:
 
