@@ -1892,14 +1892,28 @@ command = ["sh", "-c", '"$HERDR_BIN_PATH" --list >/dev/null; printf "%s\n" "$?" 
         std::fs::create_dir_all(&root).unwrap();
         let executable = root.join("herdr test");
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-        let result = std::process::Command::new(&executable)
-            .args([
-                "--exact",
-                "app::api::plugins::tests::plugin_launch_survives_executable_replacement",
-                "--nocapture",
-            ])
-            .env(CHILD_ROOT, &root)
-            .output();
+        // A child forked by a parallel test can briefly hold the copy's write
+        // descriptor, which makes exec fail with ETXTBSY until it execs too.
+        let mut attempts = 0;
+        let result = loop {
+            let result = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "app::api::plugins::tests::plugin_launch_survives_executable_replacement",
+                    "--nocapture",
+                ])
+                .env(CHILD_ROOT, &root)
+                .output();
+            attempts += 1;
+            match &result {
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => break result,
+            }
+        };
         std::fs::remove_dir_all(&root).unwrap();
         let output = result.unwrap();
         assert!(
@@ -2871,6 +2885,8 @@ command = ["sh", "-c", "printf '%s' \"$HERDR_PLUGIN_ACTION_ID\""]
     #[cfg(unix)]
     #[test]
     fn manifest_action_invoke_injects_plugin_paths() {
+        // The expected config dir comes from XDG_CONFIG_HOME, which other tests change.
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
         let mut app = test_app();
         let root = unique_temp_path("plugin-action-path-env");
         write_manifest_content(

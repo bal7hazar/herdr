@@ -1990,6 +1990,23 @@ mod tests {
             .expect("failed to open pty")
     }
 
+    /// Polls until the job shows `name`; a loaded machine can take longer than
+    /// any fixed delay to start or exec it.
+    #[cfg(target_os = "linux")]
+    fn wait_for_foreground_process(pid: u32, name: &str) -> Option<crate::platform::ForegroundJob> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let job = foreground_job(pid);
+            let found = job
+                .as_ref()
+                .is_some_and(|job| job.processes.iter().any(|process| process.name == name));
+            if found || std::time::Instant::now() >= deadline {
+                return job;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn foreground_job_detects_sleep() {
@@ -2003,10 +2020,7 @@ mod tests {
         let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
         let pid = child.process_id().expect("no pid");
 
-        // Give the process a moment to become the foreground group
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let job = foreground_job(pid).expect("expected foreground job");
+        let job = wait_for_foreground_process(pid, "sleep").expect("expected foreground job");
         assert!(
             job.processes.iter().any(|p| p.name == "sleep"),
             "expected sleep in {job:?}"
@@ -2041,9 +2055,7 @@ mod tests {
         writer.write_all(b"exec sleep 999\n").ok();
         drop(writer);
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let job = foreground_job(pid).expect("expected foreground job");
+        let job = wait_for_foreground_process(pid, "sleep").expect("expected foreground job");
         assert!(
             job.processes.iter().any(|p| p.name == "sleep"),
             "expected sleep in {job:?}"
@@ -2070,9 +2082,8 @@ mod tests {
         cmd.arg("bash -c 'exec -a codex sleep 999' & wait");
         let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
         let pid = child.process_id().expect("no pid");
-        std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let job = foreground_job(pid);
+        let job = wait_for_foreground_process(pid, "sleep");
         let process_group_id = job.as_ref().map(|job| job.process_group_id).unwrap_or(pid);
         unsafe {
             libc::kill(-(process_group_id as i32), libc::SIGKILL);

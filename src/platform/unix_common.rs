@@ -391,6 +391,9 @@ pub(crate) fn local_stream_peer_description(stream: &crate::ipc::LocalStream) ->
 }
 
 pub(crate) fn begin_cli_output() {
+    // Tests share one process, so a CLI test must not leave SIGPIPE fatal for
+    // the socket and pipe tests that run after it.
+    #[cfg(not(test))]
     set_sigpipe_disposition(libc::SIG_DFL);
 }
 

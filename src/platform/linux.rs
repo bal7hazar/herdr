@@ -1239,12 +1239,11 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use std::{cell::RefCell, collections::HashMap};
 
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::config::test_config_env_lock()
     }
 
     #[test]
@@ -1976,6 +1975,8 @@ mod tests {
 
     #[test]
     fn finite_clipboard_commands_report_exit_status() {
+        // `sh` is found through PATH, which other tests replace while they run.
+        let _guard = env_lock().lock().unwrap();
         let success = ClipboardCommand {
             program: "sh",
             args: &["-c", "cat >/dev/null"],
@@ -2032,6 +2033,8 @@ mod tests {
 
     #[test]
     fn read_clipboard_text_with_command_rejects_oversized_output() {
+        // The command is found through PATH, which other tests replace.
+        let _guard = env_lock().lock().unwrap();
         let command = ClipboardCommand {
             program: "sh",
             args: &["-c", "yes x | head -c 1048578"],
@@ -2042,6 +2045,8 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_reads_under_limit() {
+        // The command is found through PATH, which other tests replace.
+        let _guard = env_lock().lock().unwrap();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf image");
 
@@ -2053,6 +2058,8 @@ mod tests {
 
     #[test]
     fn read_clipboard_image_with_spawned_command_rejects_over_limit() {
+        // The command is found through PATH, which other tests replace.
+        let _guard = env_lock().lock().unwrap();
         let mut command = Command::new("sh");
         command.arg("-c").arg("printf oversized");
 
@@ -2174,6 +2181,8 @@ mod tests {
 
     #[test]
     fn read_validated_clipboard_image_accepts_real_png_payload() {
+        // The command is found through PATH, which other tests replace.
+        let _guard = env_lock().lock().unwrap();
         assert_eq!(
             read_validated_clipboard_image(
                 "sh",
@@ -2189,6 +2198,8 @@ mod tests {
 
     #[test]
     fn read_wsl_clipboard_image_accepts_png_from_windows_command() {
+        // The command is found through PATH, which other tests replace.
+        let _guard = env_lock().lock().unwrap();
         assert_eq!(
             read_wsl_clipboard_image_with_command(|program| {
                 assert_eq!(program, "powershell.exe");

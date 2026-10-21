@@ -61,10 +61,21 @@ fn run_shell_hook_with_env(
     let socket_path = base.join("herdr.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
+    // Accept until the hook has exited, then once more: a hook connects before
+    // it exits, and a fixed window is too short for a loaded machine.
+    let hook_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_hook_exited = hook_exited.clone();
     let server = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(700);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last_attempt = false;
         while Instant::now() < deadline {
+            if server_hook_exited.load(std::sync::atomic::Ordering::Acquire) {
+                if last_attempt {
+                    break;
+                }
+                last_attempt = true;
+            }
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     let mut line = String::new();
@@ -106,6 +117,7 @@ fn run_shell_hook_with_env(
     drop(stdin);
 
     let output = child.wait_with_output().unwrap();
+    hook_exited.store(true, std::sync::atomic::Ordering::Release);
     assert!(
         output.status.success(),
         "hook failed: status={:?} stderr={} stdout={}",

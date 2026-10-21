@@ -585,6 +585,13 @@ fn server_survives_hangup_and_logs_why_it_stops() {
 
     let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
+    // The API socket answers before the event loop installs its signal
+    // handlers; on a slow machine a signal sent in between is not handled.
+    wait_for_log_line(
+        &server_log_path(&config_home),
+        "herdr starting",
+        Duration::from_secs(10),
+    );
     let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
 
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);

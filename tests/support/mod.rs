@@ -569,12 +569,9 @@ fn ensure_cleanup_hooks() {
 
         let _ = CLEANUP_GUARD.set(CleanupGuard);
 
-        let previous_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |panic_info| {
-            cleanup_registered_herdr_pids();
-            previous_hook(panic_info);
-        }));
-
+        // No panic hook: tests run in parallel, and a failing test would stop
+        // the servers other tests are still using. A failing test stops its own
+        // server while it unwinds, and the exit hooks below catch the rest.
         let _ = ctrlc::set_handler(|| {
             cleanup_registered_herdr_pids();
             std::process::exit(130);
