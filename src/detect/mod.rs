@@ -2070,9 +2070,20 @@ mod tests {
         cmd.arg("bash -c 'exec -a codex sleep 999' & wait");
         let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
         let pid = child.process_id().expect("no pid");
-        std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let job = foreground_job(pid);
+        // Wait for the wrapped child instead of a fixed delay; a loaded machine
+        // can take longer than that to start it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let job = loop {
+            let job = foreground_job(pid);
+            let started = job
+                .as_ref()
+                .is_some_and(|job| job.processes.iter().any(|process| process.name == "sleep"));
+            if started || std::time::Instant::now() >= deadline {
+                break job;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         let process_group_id = job.as_ref().map(|job| job.process_group_id).unwrap_or(pid);
         unsafe {
             libc::kill(-(process_group_id as i32), libc::SIGKILL);

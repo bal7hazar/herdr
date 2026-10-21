@@ -4238,6 +4238,8 @@ fn install_letta_does_not_publish_hook_when_settings_are_invalid() {
 
 #[test]
 fn letta_staged_install_can_restore_the_prior_file() {
+    // unique_base clears the integration env vars other tests depend on.
+    let _lock = integration_env_lock();
     let base = unique_base();
     fs::create_dir_all(&base).unwrap();
     let target = base.join("settings.json");

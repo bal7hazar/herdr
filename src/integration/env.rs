@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::MutexGuard;
 
 use portable_pty::CommandBuilder;
 
@@ -234,30 +234,45 @@ pub(crate) fn home_dir() -> io::Result<PathBuf> {
 #[cfg(test)]
 pub(crate) struct IntegrationEnvLock {
     _guard: MutexGuard<'static, ()>,
-    #[cfg(windows)]
-    appdata: Option<std::ffi::OsString>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
+
+/// Variables integration tests replace or remove. They are restored when the
+/// lock is released, so tests sharing the process see the environment they
+/// started with.
+#[cfg(test)]
+const INTEGRATION_TEST_ENV_VARS: &[&str] = &[
+    "HOME",
+    "PATH",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+];
 
 #[cfg(test)]
 impl Drop for IntegrationEnvLock {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        if let Some(appdata) = self.appdata.take() {
-            std::env::set_var("APPDATA", appdata);
-        } else {
-            std::env::remove_var("APPDATA");
+        for (name, value) in self.saved.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn integration_env_lock() -> IntegrationEnvLock {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    // Shared with every other test that changes HOME, PATH or XDG paths.
+    let guard = crate::config::test_config_env_lock().lock().unwrap();
     IntegrationEnvLock {
         _guard: guard,
-        #[cfg(windows)]
-        appdata: std::env::var_os("APPDATA"),
+        saved: INTEGRATION_TEST_ENV_VARS
+            .iter()
+            .map(|&name| (name, std::env::var_os(name)))
+            .collect(),
     }
 }
 

@@ -309,6 +309,11 @@ mod tests {
         let lease_b = registry.register(b.clone()).unwrap();
         assert_eq!(fs::read_link(&stable).unwrap(), a);
         drop(listener_a);
+        // A child forked by a parallel test can hold the listener until it execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(&a).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(fs::metadata(&a).unwrap().file_type().is_socket());
         // Periodic checks do not probe an unchanged socket file.
         lease_b.refresh_at(Instant::now() + CHECK_INTERVAL).unwrap();
